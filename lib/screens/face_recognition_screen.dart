@@ -1,0 +1,551 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+import 'package:flutter/material.dart';
+import 'package:camera/camera.dart';
+import 'package:flutter/services.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:audioplayers/audioplayers.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
+
+class FaceRecognitionScreen extends StatefulWidget {
+  const FaceRecognitionScreen({super.key});
+
+  @override
+  State<FaceRecognitionScreen> createState() => _FaceRecognitionScreenState();
+}
+
+class _FaceRecognitionScreenState extends State<FaceRecognitionScreen>
+    with WidgetsBindingObserver {
+  CameraController? _controller;
+  bool _cameraInitialized = false;
+
+  final FaceDetector _faceDetector = FaceDetector(
+    options: FaceDetectorOptions(
+      performanceMode: FaceDetectorMode.fast,
+      enableLandmarks: false,
+      enableContours: false,
+      enableClassification: false,
+    ),
+  );
+
+  final AudioPlayer _audioPlayer = AudioPlayer();
+
+  bool _processing = false;
+  final int _cooldownMs = 1000;
+  int _lastRecognition = 0;
+
+  Uint8List? _capturedFaceBytes; // shows thumbnail (JPEG)
+  String? _imageUrl;
+  String _status = 'Initializing camera...';
+  String _userId = '';
+  String _userName = '';
+
+  // geofence center + radius
+  final double _geoLat = 12.997666;
+  final double _geoLng = 77.669542;
+  final double _geoRadiusM = 60.0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _setupCamera();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_controller == null) return;
+    if (state == AppLifecycleState.inactive) {
+      _controller?.dispose();
+    } else if (state == AppLifecycleState.resumed) {
+      _setupCamera();
+    }
+  }
+
+  Future<void> _setupCamera() async {
+    try {
+      final cameras = await availableCameras();
+      final front = cameras.firstWhere(
+        (c) => c.lensDirection == CameraLensDirection.front,
+        orElse: () => cameras.first,
+      );
+
+      _controller = CameraController(
+        front,
+        ResolutionPreset.high,
+        enableAudio: false,
+        imageFormatGroup: ImageFormatGroup.yuv420,
+      );
+
+      await _controller!.initialize();
+      if (!mounted) return;
+
+      _controller!.startImageStream(_processCameraImage);
+
+      setState(() {
+        _cameraInitialized = true;
+        _status = 'Camera ready ✅';
+      });
+    } catch (e) {
+      setState(() {
+        _status = 'Camera init error: $e';
+        _cameraInitialized = false;
+      });
+    }
+  }
+
+  InputImageRotation _rotationFromSensor(int sensorOrientation) {
+    switch (sensorOrientation) {
+      case 0:
+        return InputImageRotation.rotation0deg;
+      case 90:
+        return InputImageRotation.rotation90deg;
+      case 180:
+        return InputImageRotation.rotation180deg;
+      case 270:
+        return InputImageRotation.rotation270deg;
+      default:
+        return InputImageRotation.rotation0deg;
+    }
+  }
+
+  /// Main image stream handler.
+  Future<void> _processCameraImage(CameraImage image) async {
+    if (_processing) return;
+
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastRecognition < _cooldownMs) return;
+
+    _processing = true;
+
+    try {
+      final rotation =
+          _rotationFromSensor(_controller!.description.sensorOrientation);
+
+      final inputFormat = InputImageFormat.nv21;
+      final y = image.planes[0].bytes;
+      final u = image.planes[1].bytes;
+      final v = image.planes[2].bytes;
+      final nv21 = BytesBuilder();
+      nv21.add(y);
+      nv21.add(v);
+      nv21.add(u);
+
+      final inputImage = InputImage.fromBytes(
+        bytes: nv21.toBytes(),
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: inputFormat,
+          bytesPerRow: image.planes[0].bytesPerRow,
+        ),
+      );
+
+      final List<Face> faces = await _faceDetector.processImage(inputImage);
+
+      if (faces.isEmpty) {
+        if (mounted) {
+          setState(() {
+            _capturedFaceBytes = null;
+            _imageUrl = null;
+            _status = 'No face detected';
+          });
+        }
+        _processing = false;
+        return;
+      }
+
+      // pick largest face
+      final Face face = faces.reduce((a, b) {
+        final areaA = a.boundingBox.width * a.boundingBox.height;
+        final areaB = b.boundingBox.width * b.boundingBox.height;
+        return areaA > areaB ? a : b;
+      });
+
+      // --- Pose filter (pitch, yaw, roll) ---
+      final double pitch = face.headEulerAngleX ?? 0.0;
+      final double yaw = face.headEulerAngleY ?? 0.0;
+      final double roll = face.headEulerAngleZ ?? 0.0;
+      if (pitch.abs() > 10 || yaw.abs() > 15 || roll.abs() > 15) {
+        if (mounted) {
+          setState(() => _status = 'Please face camera straight');
+        }
+        _processing = false;
+        return;
+      }
+
+      // Crop & encode JPEG
+      final jpeg = await _cropAndEncodeToJpeg(image, face.boundingBox);
+      if (jpeg == null) {
+        _processing = false;
+        return;
+      }
+
+      if (mounted) {
+        setState(() {
+          _capturedFaceBytes = jpeg;
+          _imageUrl = null;
+          _status = 'Recognizing...';
+        });
+      }
+
+      // Check geofence
+      final pos = await _getAndCheckLocation();
+      if (pos == null) {
+        _processing = false;
+        return; // Early exit if location is not available or permission denied
+      }
+
+      final base64Jpeg = base64Encode(jpeg);
+      final result = await _sendToServer(base64Jpeg, pos.latitude, pos.longitude);
+
+      _lastRecognition = DateTime.now().millisecondsSinceEpoch;
+
+      if (result['matched'] == true) {
+        if (mounted) {
+          setState(() {
+      _userId = result['user_id']?.toString() ?? 'N/A';
+      _userName = result['name']?.toString() ?? 'Unknown User';
+      _status = 'Access Granted ✅';
+      
+      // Safely access the first element if it's a list, otherwise use the direct URL.
+      if (result['face_image_url'] is List && result['face_image_url'].isNotEmpty) {
+        _imageUrl = result['face_image_url'][0];
+      } else if (result['face_image_url'] is String) {
+        _imageUrl = result['face_image_url'];
+      } else {
+        _imageUrl = null; // Or set a default placeholder image URL
+      }
+    });
+        }
+        _playSoundGranted();
+      } else {
+        if (mounted) {
+          setState(() {
+            _status = result['message']?.toString() ?? 'Face not recognized ❌';
+            _userId = '';
+            _userName = '';
+          });
+        }
+        _playSoundDenied();
+      }
+
+      Future.delayed(Duration(milliseconds: _cooldownMs), () {
+        if (mounted) {
+          setState(() {
+            _capturedFaceBytes = null;
+            _imageUrl = null;
+            _userId = '';
+            _userName = '';
+            _status = '';
+          });
+        }
+      });
+    } on PlatformException catch (e) {
+      debugPrint('PlatformException: $e');
+      if (mounted) {
+        setState(() {
+          _status = 'Face detection error';
+          _capturedFaceBytes = null;
+          _imageUrl = null;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error: $e');
+      if (mounted) {
+        setState(() {
+          _status = 'Error: $e';
+          _capturedFaceBytes = null;
+          _imageUrl = null;
+        });
+      }
+    } finally {
+      _processing = false;
+    }
+  }
+
+  // New function to handle location permission and fetching
+  Future<Position?> _getAndCheckLocation() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+
+    // Check if location services are enabled
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      if (mounted) {
+        setState(() {
+          _status = 'Location services are disabled.';
+        });
+      }
+      return null;
+    }
+
+    // Check location permissions
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        if (mounted) {
+          setState(() {
+            _status = 'Location permissions are denied ❌';
+          });
+        }
+        return null;
+      }
+    }
+
+    if (permission == LocationPermission.deniedForever) {
+      if (mounted) {
+        setState(() {
+          _status = 'Location permissions are permanently denied. We cannot request permissions.';
+        });
+      }
+      return null;
+    }
+
+    // Get the current position and check geofence
+    try {
+      final pos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+      if (!_isInsideGeofence(pos.latitude, pos.longitude)) {
+        if (mounted) setState(() => _status = 'Outside Geofence ❌');
+        _playSoundDenied();
+        return null;
+      }
+      return pos;
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Location fetch error: $e');
+      return null;
+    }
+  }
+
+  img.Image? _convertCameraImage(CameraImage image) {
+    try {
+      if (image.format.group != ImageFormatGroup.yuv420) {
+        return null;
+      }
+
+      final int width = image.width;
+      final int height = image.height;
+      final img.Image convertedImage = img.Image(width: width, height: height);
+
+      final int yPlaneRowStride = image.planes[0].bytesPerRow;
+      final int uPlaneRowStride = image.planes[1].bytesPerRow;
+      final int vPlaneRowStride = image.planes[2].bytesPerRow;
+      final int uPlanePixelStride = image.planes[1].bytesPerPixel!;
+      final int vPlanePixelStride = image.planes[2].bytesPerPixel!;
+
+      for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+          final int yIndex = y * yPlaneRowStride + x;
+          final int uIndex = (y ~/ 2) * uPlaneRowStride + (x ~/ 2) * uPlanePixelStride;
+          final int vIndex = (y ~/ 2) * vPlaneRowStride + (x ~/ 2) * vPlanePixelStride;
+
+          final int yValue = image.planes[0].bytes[yIndex];
+          final int uValue = image.planes[1].bytes[uIndex];
+          final int vValue = image.planes[2].bytes[vIndex];
+
+          // YUV to RGB conversion formula
+          int r = (yValue + 1.402 * (vValue - 128)).round().clamp(0, 255);
+          int g = (yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128)).round().clamp(0, 255);
+          int b = (yValue + 1.772 * (uValue - 128)).round().clamp(0, 255);
+
+          convertedImage.setPixelRgb(x, y, r, g, b);
+        }
+      }
+      return convertedImage;
+    } catch (e) {
+      debugPrint('Error converting YUV420 to RGB: $e');
+      return null;
+    }
+  }
+
+  /// New crop + jpeg encoding using the image package
+  /// New crop + jpeg encoding using the image package
+Future<Uint8List?> _cropAndEncodeToJpeg(CameraImage image, Rect bbox) async {
+  try {
+    final img.Image? fullImage = _convertCameraImage(image);
+    if (fullImage == null) return null;
+
+    // --- NEW: Rotate the image based on device orientation ---
+    final int rotation = _controller!.description.sensorOrientation;
+    img.Image rotatedImage = fullImage;
+
+    // The image from the front camera is already mirrored, so we need to
+    // apply rotation to the original, un-mirrored image data.
+    // The `_convertCameraImage` function already handles the mirroring,
+    // so we just need to rotate. A common pattern is to rotate by
+    // a certain degree for front cameras in portrait mode.
+    // Assuming a typical phone setup where a front camera has a 90-degree
+    // sensor orientation in portrait, we'll rotate it.
+    if (_controller!.description.lensDirection == CameraLensDirection.front) {
+      if (rotation == 90 || rotation == 270) {
+        rotatedImage = img.copyRotate(fullImage, angle: 270);
+      }
+    } else {
+      rotatedImage = img.copyRotate(fullImage, angle: rotation);
+    }
+    
+    // Calculate crop rectangle with a margin.
+    final margin = 0.30 * max(bbox.width, bbox.height);
+    final int left = max(0, (bbox.left - margin).round());
+    final int top = max(0, (bbox.top - margin).round());
+    final int width = min(rotatedImage.width - left, (bbox.width + 2 * margin).round());
+    final int height = min(rotatedImage.height - top, (bbox.height + 2 * margin).round());
+
+    // Crop the image using the image package.
+    final img.Image croppedImage = img.copyCrop(
+      rotatedImage,
+      x: left,
+      y: top,
+      width: width,
+      height: height,
+    );
+
+    // Resize the cropped image to 160x160.
+    final img.Image resizedImage = img.copyResize(
+      croppedImage,
+      width: 160,
+      height: 160,
+    );
+    
+    // The previous flipHorizontal might not be needed depending on the server model,
+    // but we'll keep it for consistency with your original code.
+    final img.Image flippedImage = img.flipHorizontal(resizedImage);
+    
+    // Encode directly to JPEG.
+    final jpegBytes = img.encodeJpg(flippedImage, quality: 90);
+    return Uint8List.fromList(jpegBytes);
+
+  } catch (e) {
+    debugPrint('_cropAndEncodeToJpeg error: $e');
+    return null;
+  }
+}
+
+  bool _isInsideGeofence(double lat, double lng) {
+    final distance = Geolocator.distanceBetween(lat, lng, _geoLat, _geoLng);
+    return distance <= _geoRadiusM;
+  }
+
+  Future<Map<String, dynamic>> _sendToServer(
+      String base64Jpeg, double lat, double lng) async {
+    try {
+      final resp = await http.post(
+        Uri.parse('http://accesstemp.telepresenz.com/recognize'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'face_image': 'data:image/jpeg;base64,$base64Jpeg',
+          'latitude': lat,
+          'longitude': lng,
+        }),
+      );
+
+      if (resp.statusCode == 200) {
+        return jsonDecode(resp.body) as Map<String, dynamic>;
+      } else {
+        return {'matched': false, 'message': 'Server error: ${resp.statusCode}'};
+      }
+    } catch (e) {
+      debugPrint('_sendToServer error: $e');
+      return {'matched': false, 'message': 'Network error'};
+    }
+  }
+
+  Future<void> _playSoundGranted() async {
+    try {
+      await _audioPlayer.play(AssetSource('assets/sounds/access_granted.mp3'));
+    } catch (_) {}
+  }
+
+  Future<void> _playSoundDenied() async {
+    try {
+      await _audioPlayer.play(AssetSource('assets/sounds/access_denied.mp3'));
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _controller?.dispose();
+    _faceDetector.close();
+    _audioPlayer.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.of(context).size.height;
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: _controller == null || !_cameraInitialized
+          ? Center(child: Text(_status, style: const TextStyle(color: Colors.white)))
+          : Stack(
+              children: [
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: SizedBox(
+                    height: screenHeight * 0.8,
+                    child: CameraPreview(_controller!),
+                  ),
+                ),
+                Positioned(
+                  bottom: 30,
+                  left: 20,
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Container(
+                        width: 100,
+                        height: 100,
+                        decoration: BoxDecoration(
+                          color: Colors.black,
+                          border: Border.all(color: Colors.white, width: 2),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        clipBehavior: Clip.hardEdge,
+                        child: _imageUrl != null
+                            ? Image.network(
+                                _imageUrl!,
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) => Image.asset(
+                                    'assets/images/placeholder.png',
+                                    fit: BoxFit.cover),
+                              )
+                            : (_capturedFaceBytes != null
+                                ? Image.memory(_capturedFaceBytes!,
+                                    fit: BoxFit.cover)
+                                : Image.asset('assets/images/placeholder.png',
+                                    fit: BoxFit.cover)),
+                      ),
+                      const SizedBox(width: 12),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text('ID: $_userId',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold)),
+                          Text('Name: $_userName',
+                              style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 6),
+                          Text(_status,
+                              style: const TextStyle(color: Colors.yellowAccent)),
+                        ],
+                      )
+                    ],
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+}

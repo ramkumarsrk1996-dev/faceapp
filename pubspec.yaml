@@ -1,0 +1,44 @@
+name: face_recognition_app
+description: "A new Flutter project."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.11.0+1
+  google_mlkit_face_detection: ^0.11.1
+  http: ^1.2.2
+  path_provider: ^2.1.5
+  image: ^4.1.0
+  cupertino_icons: ^1.0.8
+  geolocator: ^10.1.0
+  audioplayers: ^6.1.0
+  cached_network_image: ^3.3.1
+  google_mlkit_commons: ^0.8.0
+ 
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/ic_launcher.png" #
+  min_sdk_android: 21 
+  flutter_launcher_icons: "^0.13.1" 
+  
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: "^0.13.1" 
+  device_preview : 1.2.0 
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/sounds/access_granted.mp3
+    - assets/sounds/access_denied.mp3
+    - assets/images/placeholder.png
